@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "start": "flow-remove-types --out-file appNoTypes.js app.js -a && node appNoTypes.js"
+    "start": "rm -rf logs && flow-remove-types --out-file appNoTypes.js app.js -a && node appNoTypes.js"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
@@ -15,6 +15,7 @@
     "jade": "~1.11.0",
     "lokijs": "^1.5.12",
     "morgan": "~1.9.1",
+    "winston": "^3.3.3",
     "ws": "^8.2.3"
   },
   "main": "appNoTypes.js",
