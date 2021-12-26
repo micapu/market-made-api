@@ -172,9 +172,9 @@ function insertSorted(array, value, compareFun) {
     return insertIndex
 }
 
-function sendError(socket, message) {
-    console.log("Error sent: ", message)
-    socket.emit('erroneousAction', {message: message || "No message"});
+function sendError(socket, message, errorDetails) {
+    console.log("Error sent: ", message, errorDetails)
+    socket.emit('erroneousAction', {message: message || "No message", errorDetails});
 }
 
 function recordGameDataTransaction(transaction, gameId) {
@@ -254,9 +254,33 @@ function getScrapedValue({totalLongVolume, totalShortVolume, longPosition, short
 // })()
 
 function renderGameView(gameState) {
-    const {gameMinutes, gameName, parties, expiryTimestamp, tickDecimals, finalPlayerData, finalTicks} = gameState
+    const {
+        gameMinutes,
+        gameName,
+        parties,
+        expiryTimestamp,
+        tickDecimals,
+        finalPlayerData,
+        finalTicks,
+        unitPrefix,
+        unitSuffix,
+        tickSize,
+        gameExposure
+    } = gameState
     let marketValue = gameState.finalPlayerData ? {marketValue: gameState.marketValue} : {}
-    return {gameMinutes, gameName, parties, expiryTimestamp, tickDecimals, finalPlayerData, finalTicks, ...marketValue};
+    return {
+        gameMinutes,
+        gameName,
+        parties,
+        expiryTimestamp,
+        tickDecimals,
+        finalPlayerData,
+        unitPrefix,
+        unitSuffix,
+        tickSize,
+        gameExposure,
+        finalTicks, ...marketValue
+    };
 }
 
 function countDecimals(value) {
@@ -295,6 +319,7 @@ gameNameSpace.on('connection', (socket) => {
     //    const registerEventHandler = (event, validators:[[(Socket, ContextData:any)=>Boolean, ErrorMessage:String]], listener:(data:any, contextData:any)=>{}) => {
     const registerEventHandler = (event, validators, listener) => {
         socket.on(event, (requestData) => {
+            console.log({event, requestData})
             accessLog.info({requestData})
             const contextData = new Proxy({
                 sendInfo(message) {
@@ -315,7 +340,8 @@ gameNameSpace.on('connection', (socket) => {
             })
             for (let i in validators) {
                 const [validator, errorMessage] = validators[i];
-                if (!validator(requestData, contextData)) {
+                let result = validator(requestData, contextData);
+                if (result !== true) {
                     if (contextData.userLogger)
                         contextData.userLogger.error({
                             requestData,
@@ -323,7 +349,7 @@ gameNameSpace.on('connection', (socket) => {
                             gameState: contextData.gameState,
                             userData: contextData.userData
                         });
-                    sendError(socket, errorMessage);
+                    sendError(socket, errorMessage, result);
                     return;
                 }
             }
@@ -331,7 +357,7 @@ gameNameSpace.on('connection', (socket) => {
                 contextData.gameLogger.info({requestData, event, socketId: socket.id})
             }
             if (contextData.userLogger && contextData.gameState) {
-                contextData.userLogger.debug({requestData})
+                contextData.userLogger.info({requestData})
                 contextData.userLogger.debug({contextData})
             }
 
@@ -347,6 +373,10 @@ gameNameSpace.on('connection', (socket) => {
     const gameRetriever = [(data, contextData) => {
         if (contextData.gameState) {
             return true;
+        }
+        if (!data) {
+            socket.disconnect()
+            return {message: "Data Undefined"};
         }
         const gameId = Number(data.gameId);
         const gameState = gamesTable.findOne({gameId});
@@ -394,14 +424,16 @@ gameNameSpace.on('connection', (socket) => {
         return true;
     }, "You are not an authenticated member of this market"]
 
+    const dangerousGetTickSize = () => socket.persistedContext.gameState.tickSize || "error retrieving tick size"
+
     const validPriceAuthenticator = [({unsanitizedPrice}, contextData) => {
         const price = coerceToPrice(Number(unsanitizedPrice), contextData.gameState.tickSize, contextData.gameState.tickDecimals)
         if (price === undefined || price < 0 || isNaN(price)) {
-            return false;
+            return {tickSize: dangerousGetTickSize()};
         }
         contextData.coercedPrice = price
         return true;
-    }, "Invalid price"]
+    }, "Invalid price, not a multiple of the tick size"]
 
     const getGameExpiryValidator = (alwaysAllow = false) => [(_, {gameState}) => {
         let expired = gameState.expiryTimestamp < new Date().getTime();
@@ -658,7 +690,7 @@ const db: Loki = new loki('Example');
 
 
 let gameIndex = 0;
-const gamesTable = db.addCollection('games', {indices: 'gameId'});
+const gamesTable = db.addCollection('games', {indices: ['gameId', 'expiryTimestamp']});
 const ordersTable = db.addCollection('orders', {indices: ['gameId', 'orderId']});
 const ticksTable = db.addCollection('ticks', {indices: ['gameId', 'buyer', 'seller']});
 
@@ -676,9 +708,8 @@ app.use(express.urlencoded({extended: false}));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
-function createGameFor(gameName, gameMinutes, marketValue) {
+function createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, tickSize, gameExposure) {
     let gameId = gameIndex++;
-    const tickSize = 0.1;
     // dynamic views aren't handled in a particularly clever way, each view being added is another lookup per update on the dataset
     const orderInfo = {
         bids: [],
@@ -700,18 +731,44 @@ function createGameFor(gameName, gameMinutes, marketValue) {
         orderInfo,
         playerData: {},
         transactionSequence: 0,
-        tickSize,
+        unitPrefix, unitSuffix, tickSize,
+        gameExposure,
         tickDecimals: countDecimals(tickSize)
     };
 }
 
 
 function renderGameState(gameState) {
-    const {gameName, gameMinutes, gameId, parties, orderInfo, playerData, expiryTimestamp, tickDecimals} = gameState
+    const {
+        gameName,
+        gameMinutes,
+        gameId,
+        parties,
+        orderInfo,
+        playerData,
+        expiryTimestamp,
+        tickDecimals,
+        unitPrefix,
+        unitSuffix,
+        tickSize,
+        gameExposure
+    } = gameState
     // todo maybe dont copy playerdata
     return {
-        gameName, gameMinutes, gameId, parties, playerData: {...playerData},
-        bids: orderInfo.bids, asks: orderInfo.asks, ticks: orderInfo.ticks, expiryTimestamp, tickDecimals
+        gameName,
+        gameMinutes,
+        gameId,
+        parties,
+        playerData: {...playerData},
+        unitPrefix,
+        unitSuffix,
+        tickSize,
+        gameExposure,
+        bids: orderInfo.bids,
+        asks: orderInfo.asks,
+        ticks: orderInfo.ticks,
+        expiryTimestamp,
+        tickDecimals,
     };
 }
 
@@ -719,12 +776,30 @@ function renderGameState(gameState) {
 gamesRouter.post('/', function (req, res) {
     console.log("game created", req.body);
     try {
-        const {gameName, gameMinutes, marketValue} = req.body;
-        if (!(gameName && gameMinutes) || isNaN(Number(gameMinutes))) {
-            res.status(400).send({errorMessage: 'Invalid request'});
+        const {gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, tickSize, gameExposure} = req.body;
+        if (!(gameName && gameMinutes && marketValue && tickSize && gameExposure)) {
+            res.status(400).send({errorMessage: 'All fields are required'});
             return;
         }
-        const newGame = createGameFor(gameName, gameMinutes, marketValue);
+        if (isNaN(Number(gameMinutes)) || gameMinutes <= 0) {
+            res.status(400).send({errorMessage: 'Minutes not valid'});
+            return;
+        }
+        if (isNaN(Number(tickSize)) || tickSize <= 0) {
+            res.status(400).send({errorMessage: 'Tick-size not valid'});
+            return;
+        }
+        if (isNaN(Number(marketValue))) {
+            res.status(400).send({errorMessage: 'Market Value not valid'});
+            return;
+        }
+        if (isNaN(Number(gameExposure)) || gameExposure <= 0) {
+            res.status(400).send({errorMessage: 'Exposure is not valid'});
+            return;
+        }
+
+
+        const newGame = createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, Number(tickSize), gameExposure);
 
         console.log("inserted ", newGame);
         gamesTable.insert(newGame);
@@ -739,6 +814,7 @@ gamesRouter.post('/', function (req, res) {
         let renderedGamestate = renderGameState(newGame);
         renderedGamestate.transactionId = -1;
         renderedGamestate.ackTimestamp = new Date().getTime()
+        recordGameDataTransaction(["gameView", renderGameView(newGame)], newGame.gameId)
         recordGameDataTransaction(["gameState", renderedGamestate], newGame.gameId)
 
         res.status(200).send({gameId: newGame.gameId})
