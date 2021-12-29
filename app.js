@@ -172,23 +172,10 @@ function insertSorted(array, value, compareFun) {
     return insertIndex
 }
 
-function sendError(socket, message, errorDetails) {
-    console.log("Error sent: ", message, errorDetails)
-    socket.emit('erroneousAction', {message: message || "No message", errorDetails});
-}
-
 function recordGameDataTransaction(transaction, gameId) {
     fs.appendFile(`game_data/${gameId}`, JSON.stringify(transaction) + "\n", function (err) {
         if (err) throw err;
     });
-}
-
-function emitToMarket(socket, gameState, event, object) {
-    object.transactionId = gameState.transactionSequence++
-    object.ackTimestamp = new Date().getTime()
-    recordGameDataTransaction([event, object], gameState.gameId)
-    socket.to(gameState.gameId).emit(event, object)
-    socket.emit(event, object)
 }
 
 function makePlayerData(name) {
@@ -199,7 +186,7 @@ function makePlayerData(name) {
         shortPosition: 0,
         totalOutstandingLongVolume: 0,
         totalOutstandingShortVolume: 0,
-        scrapeValue: 0,
+        scalpValue: 0,
         totalLongVolume: 0,
         totalShortVolume: 0,
         outstandingBids: {},
@@ -208,7 +195,7 @@ function makePlayerData(name) {
 }
 
 // (function() {
-function getScrapedValue({totalLongVolume, totalShortVolume, longPosition, shortPosition}, userLogger) {
+function getScalpedValue({totalLongVolume, totalShortVolume, longPosition, shortPosition}, userLogger) {
 
     const averageBuy = longPosition / totalLongVolume
     const averageAsk = shortPosition / totalShortVolume
@@ -250,14 +237,13 @@ function getScrapedValue({totalLongVolume, totalShortVolume, longPosition, short
     return (totalIterPosition - minVolPosition)*/
 }
 
-// console.log(getScrapedValue({bidTicks:[{price:1,volume:1}], askTicks:[{price:4,volume:1}, {price:2,volume: 1}], totalLongVolume:1, totalShortVolume:1, longPosition:1, shortPosition:2},{info:console.log}))
+// console.log(getScalpedValue({bidTicks:[{price:1,volume:1}], askTicks:[{price:4,volume:1}, {price:2,volume: 1}], totalLongVolume:1, totalShortVolume:1, longPosition:1, shortPosition:2},{info:console.log}))
 // })()
 
-function renderGameView(gameState) {
+function renderGameView(gameState, token) {
     const {
         gameMinutes,
         gameName,
-        parties,
         expiryTimestamp,
         tickDecimals,
         finalPlayerData,
@@ -265,13 +251,23 @@ function renderGameView(gameState) {
         unitPrefix,
         unitSuffix,
         tickSize,
-        gameExposure
+        gameExposure,
+        exposureCurrency,
+        playerData: rawPlayerData,
+        playerDataNameIndex
     } = gameState
     let marketValue = gameState.finalPlayerData ? {marketValue: gameState.marketValue} : {}
+    let yourName;
+    let yourCurrentData = rawPlayerData[token];
+    if (yourCurrentData) {
+        yourName = yourCurrentData.name
+    }
     return {
         gameMinutes,
         gameName,
-        parties,
+        imHost: gameState.hostToken === token,
+        playerData: playerDataNameIndex,
+        yourName,
         expiryTimestamp,
         tickDecimals,
         finalPlayerData,
@@ -279,6 +275,7 @@ function renderGameView(gameState) {
         unitSuffix,
         tickSize,
         gameExposure,
+        exposureCurrency,
         finalTicks, ...marketValue
     };
 }
@@ -315,13 +312,21 @@ function makeFinalPlayerData(gameState) {
 }
 
 gameNameSpace.on('connection', (socket) => {
+    /*
+
+            AUTH AND HELPER
+
+     */
     socket.persistedContext = {}
-    //    const registerEventHandler = (event, validators:[[(Socket, ContextData:any)=>Boolean, ErrorMessage:String]], listener:(data:any, contextData:any)=>{}) => {
     const registerEventHandler = (event, validators, listener) => {
         socket.on(event, (requestData) => {
             console.log({event, requestData})
             accessLog.info({requestData})
             const contextData = new Proxy({
+                sendError(message, errorDetails) {
+                    console.log("Error sent: ", message, errorDetails)
+                    socket.emit('erroneousAction', {message: message || "No message", errorDetails});
+                },
                 sendInfo(message) {
                     console.log("sent info", message)
                     socket.emit("info", {message})
@@ -329,7 +334,7 @@ gameNameSpace.on('connection', (socket) => {
                 persistContextVariable(prop, arg) {
                     socket.persistedContext[prop] = arg
                     this[prop] = arg;
-                },
+                }
             }, {
                 get: function (target, prop, receiver) {
                     if (!target.hasOwnProperty(prop)) {
@@ -349,7 +354,7 @@ gameNameSpace.on('connection', (socket) => {
                             gameState: contextData.gameState,
                             userData: contextData.userData
                         });
-                    sendError(socket, errorMessage, result);
+                    contextData.sendError(errorMessage, result);
                     return;
                 }
             }
@@ -375,15 +380,21 @@ gameNameSpace.on('connection', (socket) => {
             return true;
         }
         if (!data) {
-            socket.disconnect()
-            return {message: "Data Undefined"};
+            return {errorMessage: "Data Undefined"};
         }
         const gameId = Number(data.gameId);
         const gameState = gamesTable.findOne({gameId});
         if (!gameState) {
-            return false;
+            return {errorMessage: "Game does not exist", redirectHome: true};
         }
         contextData.persistContextVariable("gameState", gameState)
+        contextData.persistContextVariable("emitToMarket", (event, object = {}) => {
+            object.transactionId = gameState.transactionSequence++
+            object.ackTimestamp = new Date().getTime()
+            recordGameDataTransaction([event, object], gameState.gameId)
+            socket.to(gameState.gameId).emit(event, object)
+            socket.emit(event, object)
+        })
         const gameLogger = winston.createLogger({
             level: logLevel,
             format: winston.format.combine(
@@ -400,13 +411,14 @@ gameNameSpace.on('connection', (socket) => {
         return true;
     }, "Cannot join game that does not exist"]
 
-    const marketParticipantAuthenticator = [(_, contextData) => {
+    const marketParticipantAuthenticator = [({token}, contextData) => {
         if (contextData.playerData) {
             return true;
         }
-        const playerData = contextData.gameState.playerData[socket.authenticatedName]
+        const playerData = contextData.gameState.playerData[token]
+
         if (!playerData) {
-            return false;
+            return {message: "Invalid Token"};
         }
 
         contextData.persistContextVariable("userLogger", winston.createLogger({
@@ -424,19 +436,18 @@ gameNameSpace.on('connection', (socket) => {
         return true;
     }, "You are not an authenticated member of this market"]
 
-    const dangerousGetTickSize = () => socket.persistedContext.gameState.tickSize || "error retrieving tick size"
 
     const validPriceAuthenticator = [({unsanitizedPrice}, contextData) => {
         const price = coerceToPrice(Number(unsanitizedPrice), contextData.gameState.tickSize, contextData.gameState.tickDecimals)
-        if (price === undefined || price < 0 || isNaN(price)) {
-            return {tickSize: dangerousGetTickSize()};
+        if (price === undefined || isNaN(price)) {
+            return {tickSize: contextData.gameState.tickSize};
         }
         contextData.coercedPrice = price
         return true;
     }, "Invalid price, not a multiple of the tick size"]
 
     const getGameExpiryValidator = (alwaysAllow = false) => [(_, {gameState}) => {
-        let expired = gameState.expiryTimestamp < new Date().getTime();
+        let expired = gameState.expiryTimestamp && gameState.expiryTimestamp < new Date().getTime();
         if (!expired) {
             return true;
         }
@@ -456,42 +467,79 @@ gameNameSpace.on('connection', (socket) => {
         return true;
     }, "Invalid volume"]
 
+    const hostAuthenticator = [({token}, {gameState}) => {
+        return gameState.hostToken === token;
+    }, "This action requires host privileges"]
+
     const validIsBid = [({isBid}) => (typeof isBid == 'boolean'), "Invalid is-bid"]
 
     const registerMarketParticipantHandler = (event, extraValidators, listener) => {
         registerEventHandler(event, [gameRetriever, getGameExpiryValidator(), marketParticipantAuthenticator, ...extraValidators], listener)
     }
 
+    /*
+
+            EVENTS
+
+     */
+
     registerEventHandler('viewGame', [gameRetriever, getGameExpiryValidator(true)], (data, contextData) => {
-        socket.emit('gameView', renderGameView(contextData.gameState));
+        let gameState = contextData.gameState;
+        socket.emit('gameView', renderGameView(gameState, data.token));
+        let expired = gameState.expiryTimestamp && gameState.expiryTimestamp < new Date().getTime();
+        if (gameState.playerData[data.token]) {
+            joinGame(data, contextData)
+        } else if (expired) {
+            socket.join(gameState.gameId)
+        }
     })
 
-    registerEventHandler('joinGame', [gameRetriever, getGameExpiryValidator()], ({name}, {gameState}) => {
+    const joinGame = ({token, name}, {gameState, sendError, emitToMarket}) => {
+        let currentPlayer = gameState.playerData[token];
+        if (!currentPlayer) {
+            const sanitizedName = name.toString().toUpperCase()
+            if (!sanitizedName) {
+                sendError("Name too short")
+                return;
+            }
+            if (sanitizedName.length > 3) {
+                sendError("Name too long")
+                return;
+            }
+            if (gameState.playerDataNameIndex[sanitizedName]) {
+                sendError("Name already exists, perhaps add your middle name")
+                return;
+            }
+            currentPlayer = makePlayerData(sanitizedName)
+            gameState.playerData[token] = currentPlayer
+            gameState.playerDataNameIndex[sanitizedName] = currentPlayer
+            emitToMarket("playerDataUpdate", currentPlayer)
+        }
         socket.join(gameState.gameId)
         socket.gameId = gameState.gameId;
-        socket.authenticatedName = name;
-        let renderedGameState = renderGameState(gameState);
-        if (gameState.parties.indexOf(name) !== -1) {
-            const playerData = gameState.playerData[name]
-            socket.emit("youJoined", playerData)
-            socket.emit("gameState", renderedGameState)
-            return;
-        }
-        gameState.parties.push(name);
-        const playerData = makePlayerData(name)
-        gameState.playerData[name] = playerData
-        emitToMarket(socket, gameState, "gameJoin", {name});
-        socket.emit("youJoined", playerData)
-        renderedGameState = renderGameState(gameState);
-        socket.emit('gameState', renderedGameState);
-        emitToMarket(socket, gameState, "playerDataUpdate", playerData)
+        socket.authenticatedName = currentPlayer.name;
+        socket.authenticatedToken = currentPlayer.token;
+        socket.emit("youJoined", currentPlayer, renderGameState(gameState))
+    }
+
+    registerEventHandler('startGame', [gameRetriever, hostAuthenticator], (data, {gameState, emitToMarket}) => {
+        gameState.expiryTimestamp = new Date(new Date().getTime() + gameState.gameMinutes * 60000).getTime()
+        emitToMarket("gameStart")
     })
 
+    registerEventHandler('updateMarketValue', [gameRetriever, hostAuthenticator], ({marketValue}, {
+        gameState,
+        emitToMarket
+    }) => {
+        gameState.marketValue = Number(marketValue)
+        emitToMarket("marketValueUpdate", marketValue)
+    })
 
-    registerMarketParticipantHandler('pullOrders', [], (data, {gameState, playerData}) => {
+    registerEventHandler('joinGame', [gameRetriever, getGameExpiryValidator()], joinGame)
+    registerMarketParticipantHandler('pullOrders', [], (data, {gameState, playerData, emitToMarket}) => {
         Object.values(playerData.outstandingBids)
             .concat(Object.values(playerData.outstandingAsks))
-            .forEach(order => cancelOrder({gameState, playerData}, order))
+            .forEach(order => cancelOrder(gameState, playerData, emitToMarket, order))
     })
 
     const playerCanInsertVolumeAuthenticator = [({isBid}, {playerData, volume, userLogger}) => {
@@ -517,7 +565,17 @@ gameNameSpace.on('connection', (socket) => {
     registerMarketParticipantHandler(
         'insertOrder',
         [validPriceAuthenticator, validVolumeAuthenticator, validIsBid, playerCanInsertVolumeAuthenticator],
-        ({isBid, orderType}, {gameState, playerData, gameLogger, userLogger, coercedPrice, volume, sendInfo}) => {
+        ({isBid, orderType}, {
+            gameState,
+            playerData,
+            gameLogger,
+            userLogger,
+            coercedPrice,
+            volume,
+            sendInfo,
+            sendError,
+            emitToMarket
+        }) => {
             const {orderInfo, gameId} = gameState;
             const orderId = orderInfo.orderIdSequence++;
             // todo remove
@@ -539,7 +597,7 @@ gameNameSpace.on('connection', (socket) => {
             let updates = []
             let flushUpdates = () => {
                 updates.forEach(([event, update]) => {
-                    emitToMarket(socket, gameState, event, update)
+                    emitToMarket(event, update)
                 })
                 updates = []
             };
@@ -554,13 +612,14 @@ gameNameSpace.on('connection', (socket) => {
                 const aggressiveStandingOrder = orders[0]
                 if (aggressiveStandingOrder.name === socket.authenticatedName) {
                     flushUpdates();
-                    sendError(socket, "Self trade");
+                    sendError("Self trade");
                     return;
                 }
 
                 const transactedVolume = Math.min(aggressiveStandingOrder.volume, outstandingVolume)
                 aggressiveStandingOrder.volume -= transactedVolume
                 outstandingVolume -= transactedVolume;
+
                 const tickId = orderInfo.tickIdSequence++;
                 const tick = createTick(outstandingOrder, aggressiveStandingOrder, transactedVolume, outstandingOrder.isBid, tickId)
 
@@ -568,8 +627,8 @@ gameNameSpace.on('connection', (socket) => {
                 updates.push(['onTick', tick])
 
                 const {buyer, seller, price, volume} = tick;
-                let buyerData = gameState.playerData[buyer];
-                let sellerData = gameState.playerData[seller];
+                let buyerData = gameState.playerDataNameIndex[buyer];
+                let sellerData = gameState.playerDataNameIndex[seller];
                 let priceVol = price * volume;
 
                 buyerData.longPosition += priceVol
@@ -579,8 +638,8 @@ gameNameSpace.on('connection', (socket) => {
                 buyerData.totalOutstandingLongVolume -= volume
                 sellerData.totalOutstandingShortVolume -= volume
 
-                buyerData.scrapeValue = getScrapedValue(buyerData, userLogger)
-                sellerData.scrapeValue = getScrapedValue(sellerData, userLogger)
+                buyerData.scalpValue = getScalpedValue(buyerData, userLogger)
+                sellerData.scalpValue = getScalpedValue(sellerData, userLogger)
                 updates.push(['playerDataUpdate', buyerData])
                 updates.push(['playerDataUpdate', sellerData])
 
@@ -641,9 +700,7 @@ gameNameSpace.on('connection', (socket) => {
             flushUpdates();
         })
 
-    function cancelOrder(contextData, order) {
-        const {gameState, playerData} = contextData
-        const id = order.orderId;
+    function cancelOrder(gameState, playerData, emitToMarket, order) {
         socket.dangerousGameLogger.info({action: "cancelOrder", order})
         if (order.isBid) {
             playerData.totalOutstandingLongVolume -= order.volume
@@ -666,20 +723,22 @@ gameNameSpace.on('connection', (socket) => {
             orderList.splice(index, 1);
         }
 
-        emitToMarket(socket, gameState, 'orderUpdate', order)
+        emitToMarket('orderUpdate', order)
     }
 
     registerMarketParticipantHandler('cancelOrder', [validOrderAuthenticator], ({orderId}, {
         gameState,
         playerData,
-        order
+        order,
+        sendError,
+        emitToMarket
     }) => {
         if (order.name !== socket.authenticatedName) {
-            sendError(socket, "order is not yours!" + socket.authenticatedName + order + id)
+            sendError("Order is not yours!", {orderId})
             return;
         }
 
-        cancelOrder({gameState, playerData}, order);
+        cancelOrder(gameState, playerData, emitToMarket, order);
     })
 
 });
@@ -708,7 +767,7 @@ app.use(express.urlencoded({extended: false}));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
-function createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, tickSize, gameExposure) {
+function createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, tickSize, gameExposure, exposureCurrency, hostToken) {
     let gameId = gameIndex++;
     // dynamic views aren't handled in a particularly clever way, each view being added is another lookup per update on the dataset
     const orderInfo = {
@@ -720,19 +779,20 @@ function createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffi
         ordersById: {}
     }
 
-    const expiryTimestamp = new Date(new Date().getTime() + gameMinutes * 60000).getTime();
     return {
         gameName,
         gameMinutes: Number(gameMinutes),
         gameId,
-        expiryTimestamp,
-        parties: [],
+        expiryTimestamp: null,
         marketValue,
         orderInfo,
         playerData: {},
+        playerDataNameIndex: {},
         transactionSequence: 0,
         unitPrefix, unitSuffix, tickSize,
         gameExposure,
+        hostToken,
+        exposureCurrency,
         tickDecimals: countDecimals(tickSize)
     };
 }
@@ -743,32 +803,37 @@ function renderGameState(gameState) {
         gameName,
         gameMinutes,
         gameId,
-        parties,
         orderInfo,
-        playerData,
+        playerData: rawPlayerData,
         expiryTimestamp,
         tickDecimals,
         unitPrefix,
         unitSuffix,
         tickSize,
-        gameExposure
+        gameExposure,
+        exposureCurrency
     } = gameState
-    // todo maybe dont copy playerdata
+    const playerDataByName = {}
+    Object.values(rawPlayerData).forEach((playerData) => {
+        playerDataByName[playerData.name] = playerData;
+    })
+
     return {
         gameName,
         gameMinutes,
         gameId,
-        parties,
-        playerData: {...playerData},
+        playerData: playerDataByName,
         unitPrefix,
         unitSuffix,
         tickSize,
-        gameExposure,
+        // todo keep these as hierarchical
         bids: orderInfo.bids,
         asks: orderInfo.asks,
         ticks: orderInfo.ticks,
         expiryTimestamp,
         tickDecimals,
+        exposureCurrency,
+        gameExposure
     };
 }
 
@@ -776,9 +841,19 @@ function renderGameState(gameState) {
 gamesRouter.post('/', function (req, res) {
     console.log("game created", req.body);
     try {
-        const {gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, tickSize, gameExposure} = req.body;
-        if (!(gameName && gameMinutes && marketValue && tickSize && gameExposure)) {
-            res.status(400).send({errorMessage: 'All fields are required'});
+        let {
+            gameName,
+            gameMinutes,
+            marketValue,
+            unitPrefix,
+            unitSuffix,
+            tickSize,
+            gameExposure,
+            exposureCurrency,
+            token
+        } = req.body;
+        if (!(gameName && gameMinutes && tickSize && gameExposure && exposureCurrency)) {
+            res.status(400).send({errorMessage: 'Missing required fields'});
             return;
         }
         if (isNaN(Number(gameMinutes)) || gameMinutes <= 0) {
@@ -789,20 +864,23 @@ gamesRouter.post('/', function (req, res) {
             res.status(400).send({errorMessage: 'Tick-size not valid'});
             return;
         }
-        if (isNaN(Number(marketValue))) {
+        if (marketValue && isNaN(Number(marketValue))) {
             res.status(400).send({errorMessage: 'Market Value not valid'});
             return;
+        }
+        if (!marketValue) {
+            marketValue = null;
         }
         if (isNaN(Number(gameExposure)) || gameExposure <= 0) {
             res.status(400).send({errorMessage: 'Exposure is not valid'});
             return;
         }
 
-
-        const newGame = createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, Number(tickSize), gameExposure);
+        const newGame = createGameFor(gameName, gameMinutes, marketValue, unitPrefix, unitSuffix, Number(tickSize), gameExposure, exposureCurrency, token);
+        gamesTable.insert(newGame);
 
         console.log("inserted ", newGame);
-        gamesTable.insert(newGame);
+
         try {
             let dir = 'game_data';
             const tempDir = path.resolve(__dirname, dir)
@@ -811,11 +889,11 @@ gamesRouter.post('/', function (req, res) {
         } catch (a) {
         }
 
-        let renderedGamestate = renderGameState(newGame);
-        renderedGamestate.transactionId = -1;
-        renderedGamestate.ackTimestamp = new Date().getTime()
-        recordGameDataTransaction(["gameView", renderGameView(newGame)], newGame.gameId)
-        recordGameDataTransaction(["gameState", renderedGamestate], newGame.gameId)
+        let renderedGameState = renderGameState(newGame);
+        renderedGameState.transactionId = -1;
+        renderedGameState.ackTimestamp = new Date().getTime()
+        recordGameDataTransaction(["gameView", renderGameView(newGame, null)], newGame.gameId)
+        recordGameDataTransaction(["gameState", renderedGameState], newGame.gameId)
 
         res.status(200).send({gameId: newGame.gameId})
     } catch (e) {
